@@ -174,6 +174,66 @@ def collect_frames_from_dir(frame_dir: str, exts=(".jpg", ".jpeg", ".png")) -> l
         paths.extend(glob.glob(os.path.join(frame_dir, f"*{ext.upper()}")))
     return sorted(paths)
 
+def crop_image_by_fraction(
+    image: np.ndarray,
+    crop_left: float,
+    crop_right: float,
+    crop_top: float,
+    crop_bottom: float,
+) -> np.ndarray:
+    """
+    Crop image by fractional margins.
+    Fractions are relative to width/height and must be in [0, 0.49].
+    """
+    h, w = image.shape[:2]
+
+    if not (0.0 <= crop_left < 0.5 and 0.0 <= crop_right < 0.5 and
+            0.0 <= crop_top < 0.5 and 0.0 <= crop_bottom < 0.5):
+        raise ValueError("Crop fractions must be in [0, 0.5).")
+
+    x1 = int(round(w * crop_left))
+    x2 = int(round(w * (1.0 - crop_right)))
+    y1 = int(round(h * crop_top))
+    y2 = int(round(h * (1.0 - crop_bottom)))
+
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("Invalid crop values: empty crop.")
+
+    return image[y1:y2, x1:x2]
+
+def prepare_cropped_frames(
+        image_paths: list[str],
+        out_dir: str,
+        crop_left: float,
+        crop_right: float,
+        crop_top: float,
+        crop_bottom: float,
+) -> list[str]:
+    """
+    Save cropped copies of input frames and return their paths.
+    """
+    ensure_dir(out_dir)
+    out_paths = []
+
+    for i, img_path in enumerate(image_paths):
+        img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise RuntimeError(f"Failed to read image: {img_path}")
+
+        cropped = crop_image_by_fraction(
+            img,
+            crop_left=crop_left,
+            crop_right=crop_right,
+            crop_top=crop_top,
+            crop_bottom=crop_bottom,
+        )
+
+        out_path = os.path.join(out_dir, f"cropped_{i:05d}.png")
+        cv2.imwrite(out_path, cropped)
+        out_paths.append(out_path)
+
+    return out_paths
+
 
 def resize_depth_to_image(depth: np.ndarray, image_shape_hw: tuple[int, int]) -> np.ndarray:
     h, w = image_shape_hw
@@ -286,6 +346,7 @@ def run_da3(
     ref_view_strategy: str = "middle",
     use_ray_pose: bool = False,
     export_format: str = "mini_npz-glb",
+    intrinsics: np.ndarray | None = None,
 ) -> dict:
     """
     Run official DA3 and return prediction object + extracted arrays.
@@ -293,7 +354,7 @@ def run_da3(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = DepthAnything3.from_pretrained(model_name).to(device=device)
 
-    prediction = model.inference(
+    infer_kwargs = dict(
         image=image_paths,
         export_dir=output_dir,
         export_format=export_format,
@@ -303,6 +364,10 @@ def run_da3(
         show_cameras=True,
     )
 
+    if intrinsics is not None:
+        infer_kwargs["intrinsics"] = intrinsics
+
+    prediction = model.inference(**infer_kwargs)
     result = {
         "prediction": prediction,
         "depth": np.asarray(prediction.depth),
@@ -322,6 +387,83 @@ def run_da3(
         result["intrinsics"] = np.asarray(prediction.intrinsics)
 
     return result
+def intrinsics_from_hfov_vfov(
+    width: int,
+    height: int,
+    hfov_deg: float,
+    vfov_deg: float,
+    cx: float | None = None,
+    cy: float | None = None,
+) -> np.ndarray:
+    """
+    Build an approximate 3x3 pinhole intrinsics matrix from image size and
+    horizontal/vertical field of view.
+
+    Args:
+        width: image width in pixels
+        height: image height in pixels
+        hfov_deg: horizontal field of view in degrees
+        vfov_deg: vertical field of view in degrees
+        cx: principal point x. Defaults to image center.
+        cy: principal point y. Defaults to image center.
+
+    Returns:
+        K: 3x3 intrinsics matrix
+    """
+    hfov = np.deg2rad(hfov_deg)
+    vfov = np.deg2rad(vfov_deg)
+
+    fx = width / (2.0 * np.tan(hfov / 2.0))
+    fy = height / (2.0 * np.tan(vfov / 2.0))
+
+    if cx is None:
+        cx = (width - 1) / 2.0
+    if cy is None:
+        cy = (height - 1) / 2.0
+
+    K = np.array([
+        [fx, 0.0, cx],
+        [0.0, fy, cy],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float32)
+
+    return K
+
+def cropped_fov_deg(
+    hfov_deg: float,
+    vfov_deg: float,
+    crop_left: float,
+    crop_right: float,
+    crop_top: float,
+    crop_bottom: float,
+) -> tuple[float, float]:
+    kept_w = 1.0 - crop_left - crop_right
+    kept_h = 1.0 - crop_top - crop_bottom
+
+    if kept_w <= 0 or kept_h <= 0:
+        raise ValueError("Invalid crop fractions.")
+
+    hfov = np.deg2rad(hfov_deg)
+    vfov = np.deg2rad(vfov_deg)
+
+    new_hfov = 2.0 * np.arctan(kept_w * np.tan(hfov / 2.0))
+    new_vfov = 2.0 * np.arctan(kept_h * np.tan(vfov / 2.0))
+
+    return float(np.rad2deg(new_hfov)), float(np.rad2deg(new_vfov))
+
+def crop_intrinsics(
+    K: np.ndarray,
+    crop_x: int,
+    crop_y: int,
+) -> np.ndarray:
+    """
+    Shift principal point after cropping an image.
+    crop_x, crop_y are the top-left crop offsets in original image coordinates.
+    """
+    K2 = K.copy().astype(np.float32)
+    K2[0, 2] -= crop_x
+    K2[1, 2] -= crop_y
+    return K2
 
 def extrinsics_to_camera_centers(extrinsics: np.ndarray) -> np.ndarray:
     centers = []
@@ -481,6 +623,11 @@ def main():
     parser.add_argument("--voxel_length", type=float, default=0.02)
     parser.add_argument("--sdf_trunc", type=float, default=0.08)
     parser.add_argument("--max_depth", type=float, default=10.0)
+    parser.add_argument("--crop_left", type=float, default=0.15)
+    parser.add_argument("--crop_right", type=float, default=0.15)
+    parser.add_argument("--crop_top", type=float, default=0.12)
+    parser.add_argument("--crop_bottom", type=float, default=0.13)
+    parser.add_argument("--disable_crop", action="store_true")
     args = parser.parse_args()
 
     output_dir = os.path.abspath(args.output_dir)
@@ -502,22 +649,65 @@ def main():
             step = max(1, len(image_paths) // args.max_frames)
             image_paths = image_paths[::step][:args.max_frames]
 
+
     if len(image_paths) < 2:
         raise RuntimeError("Need at least 2 frames.")
 
     print(f"[INFO] Using {len(image_paths)} frames")
 
+    if args.disable_crop:
+        working_image_paths = image_paths
+        eff_hfov_deg = 130.0
+        eff_vfov_deg = 90.0
+    else:
+        cropped_dir = os.path.join(output_dir, "cropped_frames")
+        working_image_paths = prepare_cropped_frames(
+            image_paths=image_paths,
+            out_dir=cropped_dir,
+            crop_left=args.crop_left,
+            crop_right=args.crop_right,
+            crop_top=args.crop_top,
+            crop_bottom=args.crop_bottom,
+        )
+        eff_hfov_deg, eff_vfov_deg = cropped_fov_deg(
+            hfov_deg=130.0,
+            vfov_deg=90.0,
+            crop_left=args.crop_left,
+            crop_right=args.crop_right,
+            crop_top=args.crop_top,
+            crop_bottom=args.crop_bottom,
+        )
+
+    img0 = cv2.imread(working_image_paths[0], cv2.IMREAD_COLOR)
+    if img0 is None:
+        raise RuntimeError(f"Failed to read image: {working_image_paths[0]}")
+
+    h, w = img0.shape[:2]
+
+    K_single = intrinsics_from_hfov_vfov(
+        width=w,
+        height=h,
+        hfov_deg=eff_hfov_deg,
+        vfov_deg=eff_vfov_deg,
+    )
+
+    manual_intrinsics = np.repeat(K_single[None, :, :], len(working_image_paths), axis=0)
+
+    print("[INFO] Effective HFOV/VFOV after crop:", eff_hfov_deg, eff_vfov_deg)
+    print("[INFO] Manual K:\n", K_single)
+
     da3_out_dir = os.path.join(output_dir, "da3_exports")
     ensure_dir(da3_out_dir)
 
     result = run_da3(
-        image_paths=image_paths,
+        image_paths=working_image_paths,
         output_dir=da3_out_dir,
         model_name=args.model,
         process_res=args.process_res,
         ref_view_strategy=args.ref_view_strategy,
         use_ray_pose=args.use_ray_pose,
         export_format=args.export_format,
+        intrinsics=manual_intrinsics,
     )
 
     depth = result["depth"]
@@ -526,6 +716,20 @@ def main():
 
     extrinsics = result["extrinsics"].astype(np.float32)
     intrinsics = result["intrinsics"].astype(np.float32)
+
+
+    # Optional: also inspect what DA3 returned
+    if "intrinsics" in result:
+        pred_intrinsics = result["intrinsics"].astype(np.float32)
+        print("[INFO] DA3 returned intrinsics[0]:\n", pred_intrinsics[0])
+        print("[INFO] Manual intrinsics[0]:\n", manual_intrinsics[0])
+
+        fx = intrinsics[0, 0, 0]
+        fy = intrinsics[0, 1, 1]
+        cx = intrinsics[0, 0, 2]
+        cy = intrinsics[0, 1, 2]
+        print(f"[INFO] Using downstream K[0]: fx={fx:.3f}, fy={fy:.3f}, cx={cx:.3f}, cy={cy:.3f}")
+
 
     np.save(os.path.join(output_dir, "depth.npy"), depth)
     np.save(os.path.join(output_dir, "intrinsics.npy"), intrinsics)
@@ -543,7 +747,7 @@ def main():
 
     rgbd_export_dir = os.path.join(output_dir, "rgbd_exports")
     export_per_frame_rgbd(
-        image_paths=image_paths,
+        image_paths=working_image_paths,
         depths=depth,
         intrinsics=intrinsics,
         extrinsics=extrinsics,
@@ -560,7 +764,7 @@ def main():
     )
 
     fuse_room_with_repo_utils(
-        image_paths=image_paths,
+        image_paths=working_image_paths,
         depths=depth,
         intrinsics=intrinsics,
         extrinsics=extrinsics,
@@ -571,9 +775,9 @@ def main():
     )
 
     visualize_map_and_trajectory(
-        "room_run/room_map.ply",
-        "room_run/trajectory_lines.ply",
-        "room_run/camera_centers.ply",
+        os.path.join(output_dir, "room_map.ply"),
+        os.path.join(output_dir, "trajectory_lines.ply"),
+        os.path.join(output_dir, "camera_centers.ply"),
     )
 
     print("[DONE] Outputs:")
