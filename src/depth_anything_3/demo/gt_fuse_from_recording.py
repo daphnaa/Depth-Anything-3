@@ -6,7 +6,7 @@ import numpy as np
 import open3d as o3d
 from scipy.spatial.transform import Rotation as Rot
 
-recording_dir = "/home/user1/GIT/sjtu_project/recording"
+recording_dir = "/home/user1/open3d_data/extract/SampleRedwoodRGBDImages"
 
 def make_rgbd_image(bgr_path: str, depth_path: str) -> o3d.geometry.RGBDImage:
     """
@@ -69,10 +69,10 @@ def accept_pair(m: dict) -> bool:
         return False
     return True
 
-rgb_paths = sorted(glob.glob(os.path.join(recording_dir, "rgb", "*.png")))
+rgb_paths = sorted(glob.glob(os.path.join(recording_dir, "color", "*.png")))
 depth_paths = sorted(glob.glob(os.path.join(recording_dir, "depth", "*.npy")))
 
-intrinsics = np.load(os.path.join(recording_dir, "intrinsics.npy"))
+# intrinsics = np.load(os.path.join(recording_dir, "intrinsics.npy"))
 # # extrinsics = np.load(os.path.join(recording_dir, "extrinsics.npy"))
 # yaw = 11.35
 # rx, ry, rz = np.deg2rad([0,yaw,0])
@@ -92,7 +92,7 @@ volume = o3d.pipelines.integration.ScalableTSDFVolume(
     sdf_trunc=0.08,
     color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8,
 )
-N = 3
+N = 0
 rgbd = make_rgbd_image(rgb_paths[N], depth_paths[N])
 w = 640
 h = 360
@@ -112,35 +112,59 @@ for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
     option = o3d.pipelines.odometry.OdometryOption()
     odo_init = np.identity(4)
 
-    rgbd = make_rgbd_image(rgb_path, depth_path)
-    rgbd_dest = make_rgbd_image(rgb_paths[i+1], depth_paths[i+1])
-
-    [success, trans, info] = o3d.pipelines.odometry.compute_rgbd_odometry(
-        rgbd, rgbd_dest, pinhole, prev_trans,
-        o3d.pipelines.odometry.RGBDOdometryJacobianFromColorTerm(), option)
-    print(f"INFO: {info}\n trans: {trans}")
-    # K_i = intrinsics[i]
-    # print(f"K from camera info: {K}\n, K_i from file: {K_i}")
-    # inv_trans = np.linalg.inv(trans)
+    # rgbd = make_rgbd_image(rgb_path, depth_path)
+    # rgbd_dest = make_rgbd_image(rgb_paths[i+1], depth_paths[i+1])
+    #
+    # [success, trans, info] = o3d.pipelines.odometry.compute_rgbd_odometry(
+    #     rgbd, rgbd_dest, pinhole, prev_trans,
+    #     o3d.pipelines.odometry.RGBDOdometryJacobianFromColorTerm(), option)
+    # print(f"INFO: {info}\n trans: {trans}")
+    # # K_i = intrinsics[i]
+    # # print(f"K from camera info: {K}\n, K_i from file: {K_i}")
+    # # inv_trans = np.linalg.inv(trans)
+    # # trans[:3, :3] = np.linalg.inv(trans[:3, :3])
+    #
+    # rotation = Rot.from_matrix(trans[:3, :3])
+    # print(rotation.as_euler('xyz', degrees=True))
+    # print(trans[:3, 3])
+    # # trans[:3, 3] = [0,0,0.26]
     # trans[:3, :3] = np.linalg.inv(trans[:3, :3])
+    # # trans = np.linalg.inv(trans)
+    # prev_trans = trans
+    #
+    # volume.integrate(rgbd_dest, pinhole, trans)
 
-    rotation = Rot.from_matrix(trans[:3, :3])
-    print(rotation.as_euler('xyz', degrees=True))
-    print(trans[:3, 3])
-    # trans[:3, 3] = [0,0,0.26]
-    trans[:3, :3] = np.linalg.inv(trans[:3, :3])
-    # trans = np.linalg.inv(trans)
-    prev_trans = trans
+    rgbd_src = make_rgbd_image(rgb_paths[i], depth_paths[i])
+    rgbd_tgt = make_rgbd_image(rgb_paths[i+1], depth_paths[i+1])
 
-    volume.integrate(rgbd_dest, pinhole, trans)
+    success, trans, info = o3d.pipelines.odometry.compute_rgbd_odometry(
+        rgbd_src,
+        rgbd_tgt,
+        pinhole,
+        np.eye(4),
+        o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
+        option,
+    )
+
+    print("success:", success)
+    print("trans:\n", trans)
+    print("info:\n", info)
+
+    source_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_src, pinhole)
+    target_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_tgt, pinhole)
+
+    # tutorial-style check
+    source_pcd.transform(trans)
+
+    o3d.visualization.draw_geometries([target_pcd, source_pcd])
 
 
     print(option)
 
 
-    break
-    # if i== len(rgb_paths)-5:
-    #     break
+    # break
+    if i== len(rgb_paths)-2:
+        break
 
 
 # [success_color_term, trans_color_term,
@@ -158,12 +182,12 @@ for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
 # print(trans_hybrid_term)
 
 
-mesh = volume.extract_triangle_mesh()
-mesh.compute_vertex_normals()
-
-pcd = mesh.sample_points_uniformly(number_of_points=300000)
-out_ply = os.path.join(recording_dir, "gt_fused_map.ply")
-o3d.io.write_point_cloud(out_ply, pcd)
-
-print("saved:", out_ply)
-o3d.visualization.draw_geometries([pcd])
+# mesh = volume.extract_triangle_mesh()
+# mesh.compute_vertex_normals()
+#
+# pcd = mesh.sample_points_uniformly(number_of_points=300000)
+# out_ply = os.path.join(recording_dir, "gt_fused_map.ply")
+# o3d.io.write_point_cloud(out_ply, pcd)
+#
+# print("saved:", out_ply)
+# o3d.visualization.draw_geometries([pcd])
