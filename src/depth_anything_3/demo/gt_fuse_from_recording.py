@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import glob
 import os
+from pathlib import Path
+
 import cv2
 import numpy as np
 import open3d as o3d
+import pandas as pd
 from scipy.spatial.transform import Rotation as Rot
 
-recording_dir = "/home/user1/open3d_data/extract/SampleRedwoodRGBDImages"
+recording_dir = "/home/user1/GIT/sjtu_project/recording/gazebo_capture"
 
 def make_rgbd_image(bgr_path: str, depth_path: str) -> o3d.geometry.RGBDImage:
     """
@@ -18,29 +21,60 @@ def make_rgbd_image(bgr_path: str, depth_path: str) -> o3d.geometry.RGBDImage:
     """
     bgr = cv2.imread(bgr_path, cv2.IMREAD_COLOR)
     color = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    depth = np.load(depth_path).astype(np.float32)
-    depth[~np.isfinite(depth)] = 0.0
-    depth[depth < 0] = 0.0
-    print(depth.shape)
+    bgr_path = Path(bgr_path)
+    depth_path = Path(depth_path)
+    color_o3d = o3d.io.read_image(bgr_path)
+    depth_o3d = o3d.io.read_image(depth_path)
+    # depth[~np.isfinite(depth)] = 0.0
+    # depth[depth < 0] = 0.0
+    # print(depth.shape)
 
-    if color.ndim != 3 or color.shape[2] != 3:
-        raise ValueError(f"Expected RGB image with shape (H, W, 3), got {color.shape}")
-    if depth.ndim != 2:
-        raise ValueError(f"Expected depth image with shape (H, W), got {depth.shape}")
+    # if color.ndim != 3 or color.shape[2] != 3:
+    #     raise ValueError(f"Expected RGB image with shape (H, W, 3), got {color.shape}")
+    # if depth.ndim != 2:
+    #     raise ValueError(f"Expected depth image with shape (H, W), got {depth.shape}")
 
     # color = np.ascontiguousarray(color.astype(np.uint8))
     # depth = np.ascontiguousarray(depth.astype(np.float32))
 
-    color_o3d = o3d.geometry.Image(color.astype(np.uint8))
-    depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
+    # color_o3d = o3d.geometry.Image(color.astype(np.uint8))
+    # depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
 
     return o3d.geometry.RGBDImage.create_from_color_and_depth(
         color_o3d,
         depth_o3d,
-        depth_scale=1.0,
-        depth_trunc=10.0,
-        convert_rgb_to_intensity=False,
+        # depth_scale=1.0,
+        depth_trunc=7.0,
+        # convert_rgb_to_intensity=False,
     )
+
+
+def get_odo_init(csv_df, src_idx, tgt_idx):
+    # 1. Define the rotation from ROS (X-fwd, Z-up) to Optical (Z-fwd, Y-down)
+    # This is a standard static transform for camera mounting
+    R_ros_to_eye = np.array([[0, -1, 0, 0],
+                             [0, 0, -1, 0],
+                             [1, 0, 0, 0],
+                             [0, 0, 0, 1]])
+
+    def get_world_to_camera_matrix(idx):
+        row = csv_df.iloc[idx]
+        t = np.array([row['tx'], row['ty'], row['tz']])
+        q = [row['qx'], row['qy'], row['qz'], row['qw']]
+
+        # World -> Drone Base
+        T_world_base = np.eye(4)
+        T_world_base[:3, :3] = Rot.from_quat(q).as_matrix()
+        T_world_base[:3, 3] = t
+
+        # World -> Camera Optical (Applying the coordinate swap)
+        return T_world_base @ np.linalg.inv(R_ros_to_eye)
+
+    T_tgt_cam = get_world_to_camera_matrix(tgt_idx)
+    T_src_cam = get_world_to_camera_matrix(src_idx)
+
+    # Relative move: T_init = inv(Target) * Source
+    return np.linalg.inv(T_tgt_cam) @ T_src_cam
 
 def pair_metrics(success: bool, trans: np.ndarray, info: np.ndarray) -> dict:
     rot = Rot.from_matrix(trans[:3, :3])
@@ -69,8 +103,8 @@ def accept_pair(m: dict) -> bool:
         return False
     return True
 
-rgb_paths = sorted(glob.glob(os.path.join(recording_dir, "color", "*.png")))
-depth_paths = sorted(glob.glob(os.path.join(recording_dir, "depth", "*.npy")))
+rgb_paths = sorted(glob.glob(os.path.join(recording_dir, "rgb", "*.jpg")))
+depth_paths = sorted(glob.glob(os.path.join(recording_dir, "depth", "*.png")))
 
 # intrinsics = np.load(os.path.join(recording_dir, "intrinsics.npy"))
 # # extrinsics = np.load(os.path.join(recording_dir, "extrinsics.npy"))
@@ -103,36 +137,17 @@ pinhole = o3d.camera.PinholeCameraIntrinsic(
         float(K[0, 2]), float(K[1, 2]),
     )
 
-volume.integrate(rgbd, pinhole, np.eye(4))
-
-prev_trans = np.eye(4)
+# volume.integrate(rgbd, pinhole, np.eye(4))
+last_transformation = np.identity(4)
 for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
     if i < N:
         continue
+    odo_init = last_transformation
     option = o3d.pipelines.odometry.OdometryOption()
-    odo_init = np.identity(4)
-
-    # rgbd = make_rgbd_image(rgb_path, depth_path)
-    # rgbd_dest = make_rgbd_image(rgb_paths[i+1], depth_paths[i+1])
-    #
-    # [success, trans, info] = o3d.pipelines.odometry.compute_rgbd_odometry(
-    #     rgbd, rgbd_dest, pinhole, prev_trans,
-    #     o3d.pipelines.odometry.RGBDOdometryJacobianFromColorTerm(), option)
-    # print(f"INFO: {info}\n trans: {trans}")
-    # # K_i = intrinsics[i]
-    # # print(f"K from camera info: {K}\n, K_i from file: {K_i}")
-    # # inv_trans = np.linalg.inv(trans)
-    # # trans[:3, :3] = np.linalg.inv(trans[:3, :3])
-    #
-    # rotation = Rot.from_matrix(trans[:3, :3])
-    # print(rotation.as_euler('xyz', degrees=True))
-    # print(trans[:3, 3])
-    # # trans[:3, 3] = [0,0,0.26]
-    # trans[:3, :3] = np.linalg.inv(trans[:3, :3])
-    # # trans = np.linalg.inv(trans)
-    # prev_trans = trans
-    #
-    # volume.integrate(rgbd_dest, pinhole, trans)
+    option.iteration_number_per_pyramid_level = o3d.utility.IntVector([200, 100, 50, 20])
+    option.depth_diff_max = 0.05
+    option.depth_min = 0.3
+    option.depth_max = 5.0
 
     rgbd_src = make_rgbd_image(rgb_paths[i], depth_paths[i])
     rgbd_tgt = make_rgbd_image(rgb_paths[i+1], depth_paths[i+1])
@@ -141,11 +156,21 @@ for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
         rgbd_src,
         rgbd_tgt,
         pinhole,
-        np.eye(4),
-        o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
+        odo_init,
+        o3d.pipelines.odometry.RGBDOdometryJacobianFromColorTerm(),
         option,
     )
+    # print(f"info.fitness = {info.fitness}")
 
+    if success:
+        # Keep track of the movement to use as the next guess
+        last_transformation = trans
+
+    else:
+        # If it fails, reset to Identity to try and find the floor again
+        last_transformation = np.identity(4)
+
+    print(f"For pair {i} + {i + 1} success is {success}")
     print("success:", success)
     print("trans:\n", trans)
     print("info:\n", info)
