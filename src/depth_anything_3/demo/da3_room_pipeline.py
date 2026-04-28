@@ -421,6 +421,20 @@ def intrinsics_from_hfov_vfov(
     if cy is None:
         cy = (height - 1) / 2.0
 
+    """
+    from config camera_info_example.yaml
+    fx: 465.321303
+    fy: 466.557484
+    cx: 303.131049
+    cy: 276.938277
+    """
+
+    fx = 465.321303
+    fy = 466.557484
+    cx = 303.131049
+    cy = 276.938277
+
+
     K = np.array([
         [fx, 0.0, cx],
         [0.0, fy, cy],

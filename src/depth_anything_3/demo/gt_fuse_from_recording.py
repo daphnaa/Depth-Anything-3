@@ -9,44 +9,86 @@ import open3d as o3d
 import pandas as pd
 from scipy.spatial.transform import Rotation as Rot
 
-recording_dir = "/home/user1/GIT/sjtu_project/recording/gazebo_capture"
+recording_dir = "/home/user1/Documents/xtend_da3_takes/xtend_rectified_depth_takextend_da3_take_20260427_190026/"
 
 def make_rgbd_image(bgr_path: str, depth_path: str) -> o3d.geometry.RGBDImage:
     """
-    Convert NumPy RGB/depth arrays into an Open3D RGBDImage.
+    Convert RGB/depth files into an Open3D RGBDImage.
 
-    Assumptions:
-    - color: HxWx3 uint8 RGB
-    - depth: HxW float32 depth in meters
+    Prefer .npy metric depth over visualization PNG depth.
+
+    Expected depth:
+    - .npy float/uint depth in meters or millimeters
+    - uint16 PNG in millimeters
     """
     bgr = cv2.imread(bgr_path, cv2.IMREAD_COLOR)
-    color = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    bgr_path = Path(bgr_path)
-    depth_path = Path(depth_path)
-    color_o3d = o3d.io.read_image(bgr_path)
-    depth_o3d = o3d.io.read_image(depth_path)
-    # depth[~np.isfinite(depth)] = 0.0
-    # depth[depth < 0] = 0.0
-    # print(depth.shape)
+    if bgr is None:
+        raise ValueError(f"Could not read RGB image: {bgr_path}")
 
-    # if color.ndim != 3 or color.shape[2] != 3:
-    #     raise ValueError(f"Expected RGB image with shape (H, W, 3), got {color.shape}")
-    # if depth.ndim != 2:
-    #     raise ValueError(f"Expected depth image with shape (H, W), got {depth.shape}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
-    # color = np.ascontiguousarray(color.astype(np.uint8))
-    # depth = np.ascontiguousarray(depth.astype(np.float32))
+    depth_path_obj = Path(depth_path)
+    if depth_path_obj.suffix.lower() == ".npy":
+        depth_raw = np.load(depth_path_obj)
+    else:
+        depth_raw = cv2.imread(str(depth_path_obj), cv2.IMREAD_UNCHANGED)
 
-    # color_o3d = o3d.geometry.Image(color.astype(np.uint8))
-    # depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
+    if depth_raw is None:
+        raise ValueError(f"Could not read depth image: {depth_path}")
+
+    depth_raw = np.asarray(depth_raw)
+
+    if depth_raw.ndim == 3:
+        if depth_raw.shape[-1] == 1:
+            depth_raw = depth_raw[..., 0]
+        else:
+            raise ValueError(
+                f"Depth has 3 channels: {depth_path}. "
+                "This looks like a visualization depth image, not metric depth."
+            )
+
+    target_size = (rgb.shape[1], rgb.shape[0])
+    if depth_raw.shape[:2] != rgb.shape[:2]:
+        depth_raw = cv2.resize(depth_raw, target_size, interpolation=cv2.INTER_NEAREST)
+
+    depth_raw = depth_raw.astype(np.float32)
+    depth_raw[~np.isfinite(depth_raw)] = 0.0
+    depth_raw[depth_raw < 0.0] = 0.0
+
+    valid_depth = depth_raw[depth_raw > 0.0]
+    if valid_depth.size == 0:
+        raise ValueError(f"No valid depth values found in: {depth_path}")
+
+    median_depth = float(np.median(valid_depth))
+    max_depth = float(np.max(valid_depth))
+
+    # Heuristic:
+    # - meter depth is usually around 0.1..20
+    # - millimeter depth is usually hundreds/thousands
+    if median_depth > 100.0 or max_depth > 100.0:
+        depth_raw = depth_raw / 1000.0
+
+    depth_raw = depth_raw.astype(np.float32)
+
+    print(
+        f"Loaded depth {os.path.basename(depth_path)}: "
+        f"shape={depth_raw.shape}, "
+        f"min={float(valid_depth.min())}, "
+        f"median={median_depth}, "
+        f"max={max_depth}"
+    )
+
+    color_o3d = o3d.geometry.Image(rgb)
+    depth_o3d = o3d.geometry.Image(depth_raw)
 
     return o3d.geometry.RGBDImage.create_from_color_and_depth(
         color_o3d,
         depth_o3d,
-        # depth_scale=1.0,
+        depth_scale=1.0,
         depth_trunc=7.0,
-        # convert_rgb_to_intensity=False,
+        convert_rgb_to_intensity=False,
     )
+
 
 
 def get_odo_init(csv_df, src_idx, tgt_idx):
@@ -97,6 +139,8 @@ def accept_pair(m: dict) -> bool:
         return False
     if m["score"] < 5e4:
         return False
+    if m["rot_deg"] < 1e-4 and m["t_norm"] < 1e-4:
+        return False
     if m["rot_deg"] > 5.0:
         return False
     if m["t_norm"] > 0.6:
@@ -104,7 +148,13 @@ def accept_pair(m: dict) -> bool:
     return True
 
 rgb_paths = sorted(glob.glob(os.path.join(recording_dir, "rgb", "*.jpg")))
-depth_paths = sorted(glob.glob(os.path.join(recording_dir, "depth", "*.png")))
+
+# Use metric .npy depth files, not depth visualization PNGs.
+depth_paths = sorted(glob.glob(os.path.join(recording_dir, "depth_npy", "*.npy")))
+
+assert len(rgb_paths) == len(depth_paths), (
+    f"RGB/depth count mismatch: {len(rgb_paths)} RGB, {len(depth_paths)} depth"
+)
 
 # intrinsics = np.load(os.path.join(recording_dir, "intrinsics.npy"))
 # # extrinsics = np.load(os.path.join(recording_dir, "extrinsics.npy"))
@@ -128,20 +178,23 @@ volume = o3d.pipelines.integration.ScalableTSDFVolume(
 )
 N = 0
 rgbd = make_rgbd_image(rgb_paths[N], depth_paths[N])
-w = 640
-h = 360
+
+first_bgr = cv2.imread(rgb_paths[N], cv2.IMREAD_COLOR)
+h, w = first_bgr.shape[:2]
 
 pinhole = o3d.camera.PinholeCameraIntrinsic(
-        w, h,
-        float(K[0, 0]), float(K[1, 1]),
-        float(K[0, 2]), float(K[1, 2]),
-    )
+    w, h,
+    float(K[0, 0]), float(K[1, 1]),
+    float(K[0, 2]), float(K[1, 2]),
+)
 
 # volume.integrate(rgbd, pinhole, np.eye(4))
 last_transformation = np.identity(4)
-for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
-    if i < N:
-        continue
+
+accumulated_pcd = o3d.geometry.PointCloud()
+cam_to_world = np.identity(4)
+
+for i in range(100, len(rgb_paths) - 1,2):
     odo_init = last_transformation
     option = o3d.pipelines.odometry.OdometryOption()
     option.iteration_number_per_pyramid_level = o3d.utility.IntVector([200, 100, 50, 20])
@@ -150,7 +203,7 @@ for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
     option.depth_max = 5.0
 
     rgbd_src = make_rgbd_image(rgb_paths[i], depth_paths[i])
-    rgbd_tgt = make_rgbd_image(rgb_paths[i+1], depth_paths[i+1])
+    rgbd_tgt = make_rgbd_image(rgb_paths[i + 1], depth_paths[i + 1])
 
     success, trans, info = o3d.pipelines.odometry.compute_rgbd_odometry(
         rgbd_src,
@@ -160,37 +213,47 @@ for i, (rgb_path, depth_path) in enumerate(zip(rgb_paths, depth_paths)):
         o3d.pipelines.odometry.RGBDOdometryJacobianFromColorTerm(),
         option,
     )
-    # print(f"info.fitness = {info.fitness}")
 
-    if success:
-        # Keep track of the movement to use as the next guess
-        last_transformation = trans
+    metrics = pair_metrics(success, trans, info)
+    accepted = accept_pair(metrics)
 
-    else:
-        # If it fails, reset to Identity to try and find the floor again
-        last_transformation = np.identity(4)
-
-    print(f"For pair {i} + {i + 1} success is {success}")
-    print("success:", success)
+    print(f"For pair {i} + {i + 1} success is {success}, accepted is {accepted}")
     print("trans:\n", trans)
     print("info:\n", info)
 
-    source_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_src, pinhole)
+    if accepted:
+        last_transformation = trans
+
+        # Open3D RGB-D odometry returns a transform from source camera coords
+        # into target camera coords. To keep all points in frame-N/world coords,
+        # accumulate camera-to-world with inverse relative motion.
+        cam_to_world = cam_to_world @ np.linalg.inv(trans)
+    else:
+        last_transformation = np.identity(4)
+        print("Rejected odometry pair; reusing previous global pose for next frame.")
+
     target_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_tgt, pinhole)
+    print(f"Frame {i + 1} raw point count: {len(target_pcd.points)}")
 
-    # tutorial-style check
-    source_pcd.transform(trans)
+    if len(target_pcd.points) == 0:
+        print(f"Skipping frame {i + 1}: empty point cloud")
+        continue
 
-    o3d.visualization.draw_geometries([target_pcd, source_pcd])
+    target_pcd.transform(cam_to_world)
+    accumulated_pcd += target_pcd
 
-
-    print(option)
-
-
-    # break
-    if i== len(rgb_paths)-2:
+    if i % 25 == 0:
+        accumulated_pcd = accumulated_pcd.voxel_down_sample(voxel_size=0.02)
+        print(f"Accumulated {len(accumulated_pcd.points)} points so far")
+    if i == 180:
         break
+accumulated_pcd = accumulated_pcd.voxel_down_sample(voxel_size=0.02)
 
+out_ply = os.path.join(recording_dir, "gt_accumulated_cloud.ply")
+o3d.io.write_point_cloud(out_ply, accumulated_pcd)
+
+print("saved:", out_ply)
+o3d.visualization.draw_geometries([accumulated_pcd])
 
 # [success_color_term, trans_color_term,
 #  info] = o3d.pipelines.odometry.compute_rgbd_odometry(
