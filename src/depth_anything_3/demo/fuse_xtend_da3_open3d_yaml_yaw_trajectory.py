@@ -26,6 +26,9 @@ import pandas as pd
 import yaml
 from scipy.spatial.transform import Rotation as Rot
 
+FPS = 20.0
+TIME_WINDOW_SECONDS = 0.2  #
+
 
 def angle_diff_deg(a_deg: float, b_deg: float) -> float:
     """Return signed difference b - a in degrees, wrapped to [-180, 180]."""
@@ -491,7 +494,7 @@ def main() -> None:
     print(f"[info] K:\n{K}")
 
     pinhole = make_pinhole(image_w, image_h, K)
-
+    velocity_buffer = []
     metadata_df = None
     if args.metadata_csv:
         metadata_path = Path(args.metadata_csv).expanduser()
@@ -523,7 +526,6 @@ def main() -> None:
     start_idx = int(args.start_idx)
     end_idx = len(rgb_paths) - 1 if args.end_idx < 0 else min(int(args.end_idx), len(rgb_paths) - 1)
     step = max(int(args.step), 1)
-
     print(f"[info] fusing frame pairs: start={start_idx}, end={end_idx}, step={step}")
     print(f"[info] use_yaw_init={args.use_yaw_init}, init_mode={args.init_mode}")
 
@@ -548,7 +550,8 @@ def main() -> None:
         **initial_pose,
     })
     trajectory_positions.append(cam_to_world[:3, 3].copy())
-
+    total_distance_m = 0.0
+    speed = 0.0
     for i in range(start_idx, end_idx, step):
         src_idx = i
         tgt_idx = i + step
@@ -604,10 +607,36 @@ def main() -> None:
             print(f"[pair {src_idx}->{tgt_idx}] yaw init rot={yaw_rot_deg:.3f} deg")
 
         if accepted:
+            t_tgt = metadata_df.iloc[tgt_idx]['stamp_sec']
+            t_src = metadata_df.iloc[src_idx]['stamp_sec']
+
+            raw_dt = (t_tgt - t_src)
+            if raw_dt > 0:
+                delta_t = raw_dt
+            else:
+                # Fallback to the expected interval (e.g., 0.05s for 20 FPS)
+                delta_t = 1.0 / FPS
+            # Calculate real delta_t (adjust divisor if timestamps are in ms or us)
+            dynamic_window_size = max(1, int(TIME_WINDOW_SECONDS / delta_t))
             last_transformation = trans
+            v_inst = metrics['translation'] / delta_t
+            velocity_buffer.append(v_inst)
+
+
+            if len(velocity_buffer) > dynamic_window_size:
+                velocity_buffer.pop(0)
+
+            v_avg = np.mean(velocity_buffer, axis=0)
+            trans_smoothed = np.eye(4)
+            trans_smoothed[:3, :3] = trans[:3, :3]  # Use the actual rotation
+            trans_smoothed[:3, 3] = v_avg * delta_t  # Use the integrated translation
+
+            speed = np.linalg.norm(v_avg)  # Magnitude of the smoothed velocity
+            step_distance = speed * delta_t
+            total_distance_m += step_distance
             # Open3D odometry returns source-camera -> target-camera.
             # To keep points in the first camera frame, accumulate the inverse.
-            cam_to_world = cam_to_world @ np.linalg.inv(trans)
+            cam_to_world = cam_to_world @ np.linalg.inv(trans_smoothed)
         else:
             last_transformation = np.eye(4, dtype=np.float64)
             print(f"[pair {src_idx}->{tgt_idx}] rejected; global pose unchanged")
@@ -626,6 +655,8 @@ def main() -> None:
             "odom_tx_m": float(metrics["translation"][0]),
             "odom_ty_m": float(metrics["translation"][1]),
             "odom_tz_m": float(metrics["translation"][2]),
+            "velocity_m_s": float(speed),
+            "integrated_dist_m": float(total_distance_m),
             "yaw_init_rot_deg": yaw_rot_deg,
             "yaw_value": metadata_value(metadata_df, tgt_idx, args.yaw_column),
             **pose_fields,
