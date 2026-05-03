@@ -536,7 +536,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rot-deg", type=float, default=10.0)
     parser.add_argument("--max-t-norm", type=float, default=0.8)
     parser.add_argument("--fallback-fps", type=float, default=20.0)
-    parser.add_argument("--velocity-tau-sec", type=float, default=0.25)
+    parser.add_argument("--velocity-tau-sec", type=float, default=0.2)
     parser.add_argument("--use-smoothed-velocity-for-pose", action="store_true")
     parser.add_argument(
         "--measure-center-depth",

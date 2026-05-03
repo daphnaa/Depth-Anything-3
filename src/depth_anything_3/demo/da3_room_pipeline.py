@@ -625,7 +625,7 @@ def main():
     src.add_argument("--frames_dir", type=str, help="Input folder of frames")
 
     parser.add_argument("--output_dir", type=str, required=True, help="Output folder")
-    parser.add_argument("--model", type=str, default="depth-anything/DA3NESTED-GIANT-LARGE")
+    parser.add_argument("--model", type=str, default="depth-anything/DA3-LARGE-1.1")
     parser.add_argument("--target_fps", type=float, default=2.0)
     parser.add_argument("--max_frames", type=int, default=120)
     parser.add_argument("--min_blur_var", type=float, default=80.0)

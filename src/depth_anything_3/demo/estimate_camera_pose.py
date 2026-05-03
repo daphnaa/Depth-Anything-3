@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import os
 
-csv_path = "/home/user1/Documents/xtend_da3_takes/xtend_rectified_depth_take_003_20260429_160647/estimated_camera_poses.csv"
+csv_path = "/home/daphnaa/Documents/xtend_da3_take_20260429_160647/estimated_camera_poses.csv"
 
 if not os.path.exists(csv_path):
     print(f"Error: Could not find {csv_path}")
